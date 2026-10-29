@@ -1,71 +1,80 @@
 <?php
-require __DIR__.'/db.php';
-$pages=['dashboard'=>'Overview','residents'=>'Residents','requests'=>'Document requests','types'=>'Document types','payments'=>'Payments','logs'=>'Activity log','reports'=>'Reports','profile'=>'My profile'];
-$page=$_GET['page']??'dashboard'; if(!isset($pages[$page]))$page='dashboard';
-$error='';
-function required(string $key): string { $v=trim((string)($_POST[$key]??'')); if($v==='')throw new RuntimeException('Please complete all required fields.'); if(mb_strlen($v)>2000)throw new RuntimeException('Please shorten the entered text.'); return $v; }
-function amount(string $key): int { $v=required($key); if(!preg_match('/^\d{1,7}(\.\d{1,2})?$/',$v))throw new RuntimeException('Enter a valid amount with up to two decimal places.'); return (int)round((float)$v*100); }
-function staff(): void {global $user; if(!$user||$user['role']!=='staff')throw new RuntimeException('Staff access required.');}
-if($_SERVER['REQUEST_METHOD']==='POST')try{
- if(!hash_equals($_SESSION['csrf']??'',$_POST['csrf']??''))throw new RuntimeException('This form expired. Refresh the page and try again.');
- $action=$_POST['action']??''; $id=(int)($_POST['id']??0);
- if($action==='login'){
-  $ip=$_SERVER['REMOTE_ADDR']??'local'; $attempt=query('SELECT * FROM login_attempts WHERE ip=?',[$ip])->fetch();
-  if($attempt&&$attempt['attempts']>=5&&time()-(int)$attempt['last_attempt']<900)throw new RuntimeException('Too many attempts. Try again in 15 minutes.');
-  $u=query('SELECT * FROM users WHERE email=?',[strtolower(required('email'))])->fetch();
-  if(!$u||!password_verify(required('password'),$u['password'])){query('INSERT INTO login_attempts VALUES(?,1,?) ON DUPLICATE KEY UPDATE attempts=CASE WHEN last_attempt < ? THEN 1 ELSE attempts+1 END,last_attempt=VALUES(last_attempt)',[$ip,time(),time()-900]);throw new RuntimeException('Email or password is incorrect.');}
-  session_regenerate_id(true);$_SESSION['uid']=$u['id'];$_SESSION['csrf']=bin2hex(random_bytes(32)); query('DELETE FROM login_attempts WHERE ip=?',[$ip]); audit('Signed in');
- }else{
-  if(!$user)throw new RuntimeException('Please sign in.');
-  if($action==='logout'){audit('Signed out');$_SESSION=[];session_regenerate_id(true);}
-  elseif($action==='resident'){
-   staff(); $name=required('name');$address=required('address');$dob=required('birthdate');$date=DateTime::createFromFormat('!Y-m-d',$dob);if(!$date||$date->format('Y-m-d')!==$dob||$dob>date('Y-m-d'))throw new RuntimeException('Enter a valid birth date.');
-   // Transaction 1: resident record plus staff audit.
-   transaction(function()use($id,$name,$address,$dob){if($id)query('UPDATE residents SET name=?,address=?,birthdate=?,phone=? WHERE id=?',[$name,$address,$dob,trim($_POST['phone']??''),$id]);else query('INSERT INTO residents(name,address,birthdate,phone) VALUES(?,?,?,?)',[$name,$address,$dob,trim($_POST['phone']??'')]);audit(($id?'Updated':'Created').' resident: '.$name);});
-  }elseif($action==='delete_resident'){
-   staff();transaction(function()use($id){if(query('SELECT COUNT(*) FROM requests WHERE resident_id=?',[$id])->fetchColumn()||query('SELECT COUNT(*) FROM users WHERE resident_id=?',[$id])->fetchColumn())throw new RuntimeException('Residents with accounts or document requests cannot be deleted.');query('DELETE FROM residents WHERE id=?',[$id]);audit('Deleted resident #'.$id);});
-  }elseif($action==='request'){
-   $rid=$user['role']==='staff'?(int)required('resident_id'):(int)$user['resident_id'];$type=query('SELECT * FROM types WHERE id=? AND active=1',[(int)required('type_id')])->fetch();if(!$type)throw new RuntimeException('Select an available document type.');$purpose=required('purpose');
-   // Transaction 2: document request, captured fee and audit.
-   transaction(function()use($rid,$type,$purpose){query('INSERT INTO requests(resident_id,type_id,purpose,fee) VALUES(?,?,?,?)',[$rid,$type['id'],$purpose,$type['fee']]);audit('Created document request #'.query('SELECT LAST_INSERT_ID()')->fetchColumn());});
-  }elseif($action==='status'){
-   staff();$status=required('status');transaction(function()use($id,$status){$r=query('SELECT * FROM requests WHERE id=?',[$id])->fetch();if(!$r)throw new RuntimeException('Request not found.');$next=['Pending'=>'Ready for Pickup','Ready for Pickup'=>'Claimed'];if(($next[$r['status']]??null)!==$status)throw new RuntimeException('Choose the next status in the request workflow.');if($status==='Claimed'&&$r['fee']>0&&!query('SELECT id FROM payments WHERE request_id=?',[$id])->fetch())throw new RuntimeException('Record payment before marking this request claimed.');query('UPDATE requests SET status=? WHERE id=?',[$status,$id]);audit('Request #'.$id.' marked '.$status);});
-  }elseif($action==='payment'){
-   staff();$rid=(int)required('request_id');$paid=amount('amount');$reference=required('reference');
-   // Transaction 3: validated payment and audit, with rollback on duplicate or error.
-   transaction(function()use($rid,$paid,$reference){$r=query('SELECT * FROM requests WHERE id=?',[$rid])->fetch();if(!$r||$r['fee']<=0||$paid!==(int)$r['fee'])throw new RuntimeException('Payment must equal the document fee.');if(query('SELECT id FROM payments WHERE request_id=?',[$rid])->fetch())throw new RuntimeException('This request has already been paid.');query('INSERT INTO payments(request_id,amount,reference) VALUES(?,?,?)',[$rid,$paid,$reference]);audit('Recorded payment for request #'.$rid);});
-  }elseif($action==='type'){
-   staff();$name=required('name');$fee=amount('fee');$requirements=required('requirements');transaction(function()use($id,$name,$fee,$requirements){if($id)query('UPDATE types SET name=?,fee=?,requirements=?,active=? WHERE id=?',[$name,$fee,$requirements,isset($_POST['active'])?1:0,$id]);else query('INSERT INTO types(name,fee,requirements) VALUES(?,?,?)',[$name,$fee,$requirements]);audit('Saved document type: '.$name);});
-  }elseif($action==='account'){
-   $name=required('name');$email=strtolower(required('email'));if(!filter_var($email,FILTER_VALIDATE_EMAIL))throw new RuntimeException('Enter a valid email address.');if(!password_verify(required('current_password'),$user['password']))throw new RuntimeException('Current password is incorrect.');$password=$_POST['new_password']??'';if($password!==''&&strlen($password)<12)throw new RuntimeException('Use at least 12 characters for your new password.');transaction(function()use($name,$email,$password,$user){query('UPDATE users SET name=?,email=?,password=? WHERE id=?',[$name,$email,$password!==''?password_hash($password,PASSWORD_DEFAULT):$user['password'],$user['id']]);audit('Updated account profile');});session_regenerate_id(true);
-  }else throw new RuntimeException('Unknown action.');
- }
- $_SESSION['flash']='Changes saved successfully.'; header('Location: index.php?page='.urlencode($page));exit;
-}catch(Throwable $ex){$error=$ex instanceof PDOException?'Unable to save. Check for duplicate records and valid selections.':$ex->getMessage();}
-if($user&&$user['role']!=='staff'&&in_array($page,['residents','types','payments','logs','reports'],true)){$page='dashboard';}
-$staff=$user&&$user['role']==='staff';
-$q=trim($_GET['q']??'');$filter=$_GET['status']??'';
-$where=$staff?'1=1':'r.resident_id='.(int)($user['resident_id']??0);
-$args=[];if($q!==''){$where.=' AND (n.name LIKE ? OR t.name LIKE ?)';$args=['%'.$q.'%','%'.$q.'%'];}if(in_array($filter,['Pending','Ready for Pickup','Claimed'],true)){$where.=' AND r.status=?';$args[]=$filter;}
-$requests=$user?query("SELECT r.*,n.name resident,t.name document,p.id payment_id,p.amount paid,p.reference FROM requests r JOIN residents n ON n.id=r.resident_id JOIN types t ON t.id=r.type_id LEFT JOIN payments p ON p.request_id=r.id WHERE $where ORDER BY r.id DESC",$args)->fetchAll():[];
-if($user&&$staff&&$page==='reports'&&($_GET['export']??'')==='excel'){
- header('Content-Type: application/vnd.ms-excel; charset=UTF-8');header('Content-Disposition: attachment; filename="barangay-transactions.xls"');
- echo '<?xml version="1.0" encoding="UTF-8"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="Transactions"><Table>';
- $rows=[['Request','Resident','Document','Status','Fee PHP','Paid PHP','Created']];foreach($requests as $r)$rows[]=[$r['id'],$r['resident'],$r['document'],$r['status'],$r['fee']/100,($r['paid']??0)/100,$r['created_at']];foreach($rows as $row){echo '<Row>';foreach($row as $v)echo '<Cell><Data ss:Type="String">'.htmlspecialchars((string)$v,ENT_XML1|ENT_QUOTES,'UTF-8').'</Data></Cell>';echo '</Row>';}echo '</Table></Worksheet></Workbook>';exit;
+require __DIR__ . '/db.php';
+require __DIR__ . '/includes/helpers.php';
+require __DIR__ . '/modules/requests/data.php';
+require __DIR__ . '/modules/requests/table.php';
+
+// The registry is the single source of truth for navigation, roles, views, and actions.
+$modules = require __DIR__ . '/modules/registry.php';
+$pages = array_map(fn(array $module): string => $module['title'], $modules);
+$page = $_GET['page'] ?? 'dashboard';
+if (!isset($modules[$page])) {
+    $page = 'dashboard';
 }
-function formStart(string $action,int $id=0): void {echo '<form method="post"><input type="hidden" name="csrf" value="'.e($_SESSION['csrf']).'"><input type="hidden" name="action" value="'.e($action).'"><input type="hidden" name="id" value="'.$id.'">';}
-function input(string $label,string $name,string $value='',string $type='text',bool $required=true): void{echo '<label>'.e($label).'<input type="'.e($type).'" name="'.e($name).'" value="'.e($value).'" '.($required?'required':'').' '.($type==='number'?'min="0" step="0.01"':'').'></label>';}
-function requestTable(array $rows,bool $canEdit): void {echo '<div class="table-wrap"><table><thead><tr><th>Request / resident</th><th>Document</th><th>Status</th><th>Fee / payment</th><th>Created</th>'.($canEdit?'<th>Next step</th>':'').'</tr></thead><tbody>';foreach($rows as $r){echo '<tr><td><strong>#'.str_pad((string)$r['id'],4,'0',STR_PAD_LEFT).'</strong><small>'.e($r['resident']).'</small></td><td>'.e($r['document']).'<small>'.e($r['purpose']).'</small></td><td><span class="badge '.($r['status']==='Pending'?'amber':($r['status']==='Claimed'?'gray':'green')).'">'.e($r['status']).'</span></td><td>'.money((int)$r['fee']).'<small>'.($r['payment_id']?'Paid':($r['fee']?'Unpaid':'No fee')).'</small></td><td>'.e(substr($r['created_at'],0,10)).'</td>';if($canEdit){echo '<td>';if($r['status']!=='Claimed'){formStart('status',(int)$r['id']);echo '<input type="hidden" name="status" value="'.($r['status']==='Pending'?'Ready for Pickup':'Claimed').'"><button class="secondary small">'.($r['status']==='Pending'?'Mark ready':'Mark claimed').'</button></form>';}else echo 'Complete';echo '</td>';}echo '</tr>';}if(!$rows)echo '<tr><td colspan="6" class="empty">No requests found. Create a request to get started.</td></tr>';echo '</tbody></table></div>';}
-?><!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=e($pages[$page])?> · BarangayGo</title><link rel="stylesheet" href="assets/style.css"></head><body>
-<?php if(!$user):?><main class="login"><section class="login-intro"><div class="brand">◈ BarangayGo</div><span class="eyebrow">YOUR COMMUNITY, CONNECTED</span><h1>Better service.<br>Stronger community.</h1><p>A simpler way to manage resident records, request documents, and keep barangay services moving.</p><div class="intro-note">Resident services, thoughtfully organized.</div></section><section class="login-form"><span class="eyebrow">WELCOME BACK</span><h2>Sign in to BarangayGo</h2><p class="muted">Use your staff or resident account to continue.</p><?php if($error):?><div class="alert error" role="alert"><?=e($error)?></div><?php endif;?><?php formStart('login');input('Email address','email','','email');input('Password','password','','password');?><button>Sign in →</button></form><details class="demo"><summary>Local demo accounts</summary><p>Staff: admin@barangay.local<br>BarangayAdmin!2026</p><p>Resident: resident@barangay.local<br>Resident!2026</p><small>Change these credentials before deployment.</small></details></section></main>
-<?php else: ?><aside class="sidebar"><a class="brand" href="index.php">◈ BarangayGo</a><div class="workspace">COMMUNITY WORKSPACE</div><nav><?php $icons=['dashboard'=>'◫','residents'=>'♙','requests'=>'▤','types'=>'▦','payments'=>'₱','logs'=>'◷','reports'=>'▥','profile'=>'⚙'];foreach($pages as $key=>$label):if(!$staff&&in_array($key,['residents','types','payments','logs','reports'],true))continue;?><a class="<?=$page===$key?'active':''?>" href="?page=<?=$key?>"><span><?=$icons[$key]?></span><?=e($label)?></a><?php endforeach;?></nav><div class="sidebar-bottom"><div class="avatar"><?=e(mb_substr($user['name'],0,1))?></div><div><strong><?=e($user['name'])?></strong><small><?=ucfirst($user['role'])?> account</small></div><?php formStart('logout');?><button class="signout" title="Sign out" aria-label="Sign out">↗</button></form></div></aside><div class="app"><header><div>Barangay services <span>/ <?=e($pages[$page])?></span></div><div class="header-right"><span class="online">● System online</span><span><?=date('M j, Y')?></span></div></header><main class="content"><div class="page-title"><div><span class="eyebrow">BARANGAY MANAGEMENT</span><h1><?=e($pages[$page])?></h1><p class="muted"><?=e(['dashboard'=>'A clear view of your community services, all in one place.','residents'=>'Keep your community’s resident information up to date.','requests'=>'Track every document from submission to pickup.','types'=>'Set available documents, fees, and submission requirements.','payments'=>'Record document payments and keep transactions organized.','logs'=>'A transparent record of account and staff activity.','reports'=>'Review transactions and export records for your office.','profile'=>'Manage your account information and password.'][$page])?></p></div><?php if($page==='dashboard'):?><a class="button" href="?page=requests#new">+ New request</a><?php endif;?></div>
-<?php if($error):?><div class="alert error" role="alert"><?=e($error)?></div><?php endif;if(isset($_SESSION['flash'])):?><div class="alert" role="status"><?=e($_SESSION['flash'])?></div><?php unset($_SESSION['flash']);endif;?>
-<?php if($page==='dashboard'):
-$scope=$staff?'1=1':'resident_id='.(int)$user['resident_id'];$stats=query("SELECT COUNT(*) total,COALESCE(SUM(status='Pending'),0) pending,COALESCE(SUM(status='Ready for Pickup'),0) ready,COALESCE(SUM(DATE(DATE_ADD(created_at, INTERVAL 8 HOUR))=DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR))),0) today FROM requests WHERE $scope")->fetch();?><div class="stats"><?php foreach([['Requests today',$stats['today'],'Submitted today','blue'],['Pending documents',$stats['pending'],'Awaiting processing','amber'],['Ready for pickup',$stats['ready'],'Available for collection','green'],[$staff?'Registered residents':'Total requests',$staff?query('SELECT COUNT(*) FROM residents')->fetchColumn():$stats['total'],$staff?'People in your community':'Your document history','purple']] as [$title,$count,$note,$color]):?><section class="stat"><div class="stat-label"><?=e($title)?><span class="stat-icon <?=$color?>">◫</span></div><strong><?=$count?></strong><small><?=e($note)?></small></section><?php endforeach;?></div><div class="overview-grid"><section class="card"><div class="card-head"><div><h2>Recent requests</h2><p class="muted">The latest document activity</p></div><a href="?page=requests">View all →</a></div><?php requestTable(array_slice($requests,0,5),false);?></section><section class="card quick"><span class="eyebrow">GET THINGS DONE</span><h2>Quick actions</h2><a href="?page=requests#new">＋ Request a document <span>→</span></a><?php if($staff):?><a href="?page=residents#new">♙ Add a resident <span>→</span></a><a href="?page=payments#new">₱ Record a payment <span>→</span></a><a href="?page=reports">▥ Export a report <span>→</span></a><?php endif;?><div class="tip"><strong>A smoother pickup</strong><p>Check document requirements and payment details before marking a request as claimed.</p></div></section></div>
-<?php elseif($page==='requests'||$page==='reports'):?><section class="card"><div class="card-head"><h2><?=$page==='reports'?'Transaction report':'All requests'?> <span class="count"><?=count($requests)?></span></h2><?php if($page==='reports'):?><div class="actions"><a class="button secondary" href="?<?=e(http_build_query(array_merge($_GET,['export'=>'excel'])))?>">Export Excel</a><button class="secondary" onclick="window.print()">Print / Save PDF</button></div><?php endif;?></div><form class="filters" method="get"><input type="hidden" name="page" value="<?=e($page)?>"><input aria-label="Search requests" name="q" placeholder="Search resident or document type…" value="<?=e($q)?>"><select name="status" aria-label="Filter status"><option value="">All statuses</option><?php foreach(['Pending','Ready for Pickup','Claimed'] as $s):?><option <?=$filter===$s?'selected':''?>><?=e($s)?></option><?php endforeach;?></select><button class="secondary">Filter</button><a href="?page=<?=e($page)?>">Reset</a></form><?php requestTable($requests,$staff&&$page==='requests');?></section><?php if($page==='requests'):?><section class="card form-card" id="new"><h2>New document request</h2><p class="muted">Review the requirements before submitting your request.</p><?php formStart('request');if($staff):?><label>Resident<select name="resident_id" required><option value="">Select resident</option><?php foreach(query('SELECT * FROM residents ORDER BY name') as $r):?><option value="<?=$r['id']?>"><?=e($r['name'])?></option><?php endforeach;?></select></label><?php endif;?><label>Document type<select name="type_id" required><option value="">Select document</option><?php foreach(query('SELECT * FROM types WHERE active=1') as $t):?><option value="<?=$t['id']?>"><?=e($t['name'])?> · <?=money((int)$t['fee'])?> — <?=e($t['requirements'])?></option><?php endforeach;?></select></label><?php input('Purpose of request','purpose');?><button>Submit request</button></form></section><?php endif;?>
-<?php elseif($page==='residents'): $edit=query('SELECT * FROM residents WHERE id=?',[(int)($_GET['edit']??0)])->fetch();?><section class="card"><div class="card-head"><h2>Resident directory</h2><a class="button" href="#new">+ Add resident</a></div><form class="filters"><input type="hidden" name="page" value="residents"><input name="q" placeholder="Search name or address…" aria-label="Search residents" value="<?=e($q)?>"><button class="secondary">Search</button><a href="?page=residents">Reset</a></form><div class="table-wrap"><table><thead><tr><th>Name</th><th>Address</th><th>Birth date</th><th>Phone</th><th>Actions</th></tr></thead><tbody><?php $residents=query('SELECT * FROM residents WHERE name LIKE ? OR address LIKE ? ORDER BY name',['%'.$q.'%','%'.$q.'%'])->fetchAll();foreach($residents as $r):?><tr><td><strong><?=e($r['name'])?></strong></td><td><?=e($r['address'])?></td><td><?=e($r['birthdate'])?></td><td><?=e($r['phone'])?></td><td><div class="actions"><a href="?page=residents&edit=<?=$r['id']?>#new">Edit</a><?php formStart('delete_resident',(int)$r['id']);?><button class="danger small" data-confirm="Delete this resident record? This cannot be undone.">Delete</button></form></div></td></tr><?php endforeach;if(!$residents):?><tr><td colspan="5" class="empty">No residents match your search.</td></tr><?php endif;?></tbody></table></div></section><section class="card form-card" id="new"><h2><?=$edit?'Edit resident':'Add a resident'?></h2><?php formStart('resident',(int)($edit['id']??0));input('Full name','name',$edit['name']??'');input('Complete address','address',$edit['address']??'');input('Birth date','birthdate',$edit['birthdate']??'','date');input('Phone number','phone',$edit['phone']??'','tel',false);?><button>Save resident</button><?php if($edit):?><a href="?page=residents">Cancel edit</a><?php endif;?></form></section>
-<?php elseif($page==='types'): $edit=query('SELECT * FROM types WHERE id=?',[(int)($_GET['edit']??0)])->fetch();?><div class="type-grid"><?php foreach(query('SELECT * FROM types ORDER BY name') as $t):?><section class="card type-card"><div class="type-icon">▤</div><span class="badge <?=$t['active']?'green':'gray'?>"><?=$t['active']?'Available':'Inactive'?></span><h2><?=e($t['name'])?></h2><div class="price"><?=money((int)$t['fee'])?></div><p class="muted">Requirements</p><p><?=e($t['requirements'])?></p><a href="?page=types&edit=<?=$t['id']?>#new">Edit document →</a></section><?php endforeach;?></div><section class="card form-card" id="new"><h2><?=$edit?'Edit document type':'Add document type'?></h2><?php formStart('type',(int)($edit['id']??0));input('Document name','name',$edit['name']??'');input('Fee (PHP)','fee',isset($edit['fee'])?(string)($edit['fee']/100):'','number');input('Requirements','requirements',$edit['requirements']??'');if($edit):?><label class="checkbox"><input type="checkbox" name="active" <?=$edit['active']?'checked':''?>> Available for new requests</label><?php endif;?><button>Save document type</button></form></section>
-<?php elseif($page==='payments'):?><section class="card"><div class="card-head"><h2>Payment ledger</h2><span class="badge green">Total collected <?=money((int)query('SELECT COALESCE(SUM(amount),0) FROM payments')->fetchColumn())?></span></div><div class="table-wrap"><table><thead><tr><th>Receipt reference</th><th>Request</th><th>Resident</th><th>Amount</th><th>Date</th></tr></thead><tbody><?php $payments=query('SELECT p.*,n.name FROM payments p JOIN requests r ON p.request_id=r.id JOIN residents n ON r.resident_id=n.id ORDER BY p.id DESC')->fetchAll();foreach($payments as $p):?><tr><td><?=e($p['reference'])?></td><td>#<?=$p['request_id']?></td><td><?=e($p['name'])?></td><td><?=money((int)$p['amount'])?></td><td><?=e($p['created_at'])?></td></tr><?php endforeach;if(!$payments):?><tr><td colspan="5" class="empty">No payments recorded yet.</td></tr><?php endif;?></tbody></table></div></section><section class="card form-card" id="new"><h2>Record payment</h2><p class="muted">Enter the full fee and the official receipt reference.</p><?php formStart('payment');?><label>Unpaid request<select name="request_id" required><option value="">Select request</option><?php foreach($requests as $r):if($r['payment_id']||!$r['fee'])continue;?><option value="<?=$r['id']?>">#<?=$r['id']?> · <?=e($r['resident'])?> · <?=e($r['document'])?> · <?=money((int)$r['fee'])?></option><?php endforeach;?></select></label><?php input('Amount received (PHP)','amount','','number');input('Official receipt reference','reference');?><button>Record payment</button></form></section>
-<?php elseif($page==='logs'):?><section class="card"><div class="card-head"><h2>Recent system activity</h2><span class="muted">Latest 200 events</span></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Account</th><th>Action</th></tr></thead><tbody><?php foreach(query('SELECT l.*,u.name FROM logs l LEFT JOIN users u ON l.user_id=u.id ORDER BY l.id DESC LIMIT 200') as $l):?><tr><td><?=e($l['created_at'])?></td><td><?=e($l['name']??'System')?></td><td><?=e($l['action'])?></td></tr><?php endforeach;?></tbody></table></div></section>
-<?php elseif($page==='profile'):?><section class="card form-card"><h2>Account details</h2><p class="muted">Your current password is required to save changes.</p><?php formStart('account');input('Full name','name',$user['name']);input('Email address','email',$user['email'],'email');input('Current password','current_password','','password');input('New password (optional, at least 12 characters)','new_password','','password',false);?><button>Save account details</button></form></section><?php endif;?>
-<footer>BarangayGo <span>Community service, made simpler.</span></footer></main></div><?php endif;?><script src="assets/app.js"></script></body></html>
+$authMode = ($_GET['auth'] ?? '') === 'register' ? 'register' : 'login';
+$error = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        if (!hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'] ?? '')) {
+            throw new RuntimeException('This form expired. Refresh the page and try again.');
+        }
+        $action = $_POST['action'] ?? '';
+        $id = (int) ($_POST['id'] ?? 0);
+        $handler = null;
+        foreach ($modules as $definition) {
+            if (isset($definition['actions'][$action])) {
+                $handler = $definition['actions'][$action];
+                break;
+            }
+        }
+        if (!$handler) {
+            throw new RuntimeException('Unknown action.');
+        }
+        if (!in_array($action, ['login', 'register'], true) && !$user) {
+            throw new RuntimeException('Please sign in.');
+        }
+        if (in_array($action, ['login', 'register'], true) && $user) {
+            throw new RuntimeException('Sign out before using another account.');
+        }
+        require_once $handler['file'];
+        $handler['function']($id, $user);
+        $_SESSION['flash'] =
+            $action === 'register'
+                ? 'Account created. You can now sign in.'
+                : 'Changes saved successfully.';
+        header(
+            'Location: ' .
+                ($action === 'register'
+                    ? 'index.php?auth=login'
+                    : 'index.php?page=' . urlencode($page)),
+        );
+        exit();
+    } catch (Throwable $exception) {
+        $error =
+            $exception instanceof PDOException
+                ? 'Unable to save. Check for duplicate records and valid selections.'
+                : $exception->getMessage();
+        if (($_POST['action'] ?? '') === 'register') {
+            $authMode = 'register';
+        }
+    }
+}
+
+$staff = $user && $user['role'] === 'staff';
+if ($user && $modules[$page]['staffOnly'] && !$staff) {
+    $page = 'dashboard';
+}
+$module = $modules[$page];
+$q = trim($_GET['q'] ?? '');
+$filter = $_GET['status'] ?? '';
+$requests =
+    $user && in_array($page, ['dashboard', 'requests', 'payments', 'reports'], true)
+        ? loadRequests($user, $staff, $q, $filter)
+        : [];
+
+if ($user && $staff && $page === 'reports' && ($_GET['export'] ?? '') === 'excel') {
+    require __DIR__ . '/modules/reports/export.php';
+}
+
+require __DIR__ . '/views/layout.php';

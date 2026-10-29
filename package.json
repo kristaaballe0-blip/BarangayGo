@@ -1,0 +1,13 @@
+{
+  "name": "barangaygo",
+  "private": true,
+  "scripts": {
+    "format": "node tools/format.mjs",
+    "format:check": "node tools/format.mjs --check"
+  },
+  "devDependencies": {
+    "@prettier/plugin-php": "^0.24.0",
+    "js-beautify": "^2.0.3",
+    "prettier": "^3.6.0"
+  }
+}

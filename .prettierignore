@@ -1,0 +1,4 @@
+node_modules/
+storage/
+database/config.local.php
+package-lock.json
